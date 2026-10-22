@@ -1,0 +1,24 @@
+# Built binary
+tasks-mcp
+tasks-mcp.exe
+
+# Go build and test artefacts
+*.test
+*.out
+*.prof
+vendor/
+
+# Runtime files written by the server
+*.tmp
+*.lock
+# Task data stays local
+tasks.json
+
+# Claude Code server registration (contains machine-specific absolute paths)
+.mcp.json
+
+# Editor and OS files
+.idea/
+.vscode/
+*.swp
+.DS_Store
