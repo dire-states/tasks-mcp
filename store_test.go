@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -35,7 +36,7 @@ func openStore(t *testing.T, path string) *Store {
 // list returns all tasks or fails the test.
 func list(t *testing.T, s *Store) []Task {
 	t.Helper()
-	tasks, err := s.List()
+	tasks, err := s.List("")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,16 +44,17 @@ func list(t *testing.T, s *Store) []Task {
 }
 
 func TestCRUD(t *testing.T) {
-	s, _ := newTestStore(t)
+	s, path := newTestStore(t)
+	dir := filepath.Dir(path)
 
-	a, err := s.Create("  Buy milk ", "2 litres")
+	a, err := s.Create("  Buy milk ", "2 litres", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a.ID != 1 || a.Title != "Buy milk" || a.CreatedAt.IsZero() || !a.CreatedAt.Equal(a.ModifiedAt) {
+	if a.ID != 1 || a.Title != "Buy milk" || a.Scope != dir || a.CreatedAt.IsZero() || !a.CreatedAt.Equal(a.ModifiedAt) {
 		t.Fatalf("unexpected task: %+v", a)
 	}
-	if _, err := s.Create("  ", ""); !errors.Is(err, ErrEmptyTitle) {
+	if _, err := s.Create("  ", "", ""); !errors.Is(err, ErrEmptyTitle) {
 		t.Fatalf("want ErrEmptyTitle, got %v", err)
 	}
 
@@ -64,14 +66,17 @@ func TestCRUD(t *testing.T) {
 	// Make the update's timestamp observably later.
 	later := a.CreatedAt.Add(time.Minute)
 	s.now = func() time.Time { return later }
-	u, err := s.Update(a.ID, nil, new("3 litres"))
+	u, err := s.Update(a.ID, nil, new("3 litres"), new(" work "))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if u.Title != "Buy milk" || u.Description != "3 litres" || !u.CreatedAt.Equal(a.CreatedAt) || !u.ModifiedAt.Equal(later) {
+	if u.Title != "Buy milk" || u.Description != "3 litres" || u.Scope != "work" || !u.CreatedAt.Equal(a.CreatedAt) || !u.ModifiedAt.Equal(later) {
 		t.Fatalf("unexpected update: %+v", u)
 	}
-	if _, err := s.Update(a.ID, new(""), nil); !errors.Is(err, ErrEmptyTitle) {
+	if r, err := s.Update(a.ID, nil, nil, new("")); err != nil || r.Scope != dir {
+		t.Fatalf("want scope reset to %q, got %+v, %v", dir, r, err)
+	}
+	if _, err := s.Update(a.ID, new(""), nil, nil); !errors.Is(err, ErrEmptyTitle) {
 		t.Fatalf("want ErrEmptyTitle, got %v", err)
 	}
 
@@ -81,7 +86,7 @@ func TestCRUD(t *testing.T) {
 	for _, err := range []error{
 		s.Delete(a.ID),
 		func() error { _, err := s.Get(a.ID); return err }(),
-		func() error { _, err := s.Update(a.ID, new("x"), nil); return err }(),
+		func() error { _, err := s.Update(a.ID, new("x"), nil, nil); return err }(),
 	} {
 		if !errors.Is(err, ErrNotFound) {
 			t.Fatalf("want ErrNotFound, got %v", err)
@@ -89,7 +94,7 @@ func TestCRUD(t *testing.T) {
 	}
 
 	// IDs are not reused after delete.
-	b, _ := s.Create("Next", "")
+	b, _ := s.Create("Next", "", "")
 	if b.ID != 2 {
 		t.Fatalf("want ID 2, got %d", b.ID)
 	}
@@ -97,11 +102,11 @@ func TestCRUD(t *testing.T) {
 
 func TestUpdateNoFields(t *testing.T) {
 	s, path := newTestStore(t)
-	a, _ := s.Create("x", "")
+	a, _ := s.Create("x", "", "")
 	before, _ := os.ReadFile(path)
 
 	s.now = func() time.Time { return a.CreatedAt.Add(time.Hour) }
-	u, err := s.Update(a.ID, nil, nil)
+	u, err := s.Update(a.ID, nil, nil, nil)
 	if err != nil || u != a {
 		t.Fatalf("want unchanged task %+v, got %+v, %v", a, u, err)
 	}
@@ -112,18 +117,72 @@ func TestUpdateNoFields(t *testing.T) {
 
 func TestSearch(t *testing.T) {
 	s, _ := newTestStore(t)
-	s.Create("Write report", "quarterly numbers")
-	s.Create("Call Bob", "about the REPORT")
-	s.Create("Groceries", "")
+	s.Create("Write report", "quarterly numbers", "")
+	s.Create("Call Bob", "about the REPORT", "")
+	s.Create("Groceries", "", "")
 
-	if got, _ := s.Search("report"); len(got) != 2 {
+	if got, _ := s.Search("report", ""); len(got) != 2 {
 		t.Fatalf("want 2 matches, got %+v", got)
 	}
-	if got, _ := s.Search(""); len(got) != 3 {
+	if got, _ := s.Search("", ""); len(got) != 3 {
 		t.Fatalf("want empty query to match all 3, got %+v", got)
 	}
-	if got, _ := s.Search("nothing"); got == nil || len(got) != 0 {
+	if got, _ := s.Search("nothing", ""); got == nil || len(got) != 0 {
 		t.Fatalf("want empty non-nil slice, got %#v", got)
+	}
+}
+
+func TestScopeFilter(t *testing.T) {
+	s, path := newTestStore(t)
+	dir := filepath.Dir(path)
+	s.Create("a", "", "work")
+	s.Create("b", "", "Work")
+	s.Create("c", "", "")
+
+	for _, c := range []struct {
+		scope string
+		want  int
+	}{
+		{"", 3},
+		{"work", 2}, // case-insensitive
+		{dir, 1},    // the default
+		{"other", 0},
+	} {
+		got, err := s.List(c.scope)
+		if err != nil || got == nil || len(got) != c.want {
+			t.Fatalf("List(%q) = %+v, %v; want %d tasks", c.scope, got, err, c.want)
+		}
+	}
+	// The query text is matched against scope too.
+	if got, _ := s.Search("work", ""); len(got) != 2 {
+		t.Fatalf("want query to match scope, got %+v", got)
+	}
+	if got, _ := s.Search("", "work"); len(got) != 2 {
+		t.Fatalf("want scope filter on search, got %+v", got)
+	}
+}
+
+func TestLegacyFileWithoutScope(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tasks.json")
+	if err := os.WriteFile(path, []byte(`{"next_id":2,"tasks":[{"id":1,"title":"old"}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := openStore(t, path)
+	dir := filepath.Dir(path)
+
+	// Backfilled on read.
+	got, err := s.Get(1)
+	if err != nil || got.Scope != dir {
+		t.Fatalf("want scope %q, got %+v, %v", dir, got, err)
+	}
+	// Persisted on the next write.
+	if _, err := s.Update(1, new("renamed"), nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(path)
+	quoted, _ := json.Marshal(dir)
+	if !bytes.Contains(b, []byte(`"scope": `+string(quoted))) {
+		t.Fatalf("scope not persisted; file:\n%s", b)
 	}
 }
 
@@ -136,8 +195,8 @@ func TestListEmptyIsNonNil(t *testing.T) {
 
 func TestPersistence(t *testing.T) {
 	s, path := newTestStore(t)
-	s.Create("one", "")
-	s.Create("two", "desc")
+	s.Create("one", "", "")
+	s.Create("two", "desc", "")
 	s.Delete(1)
 
 	r := openStore(t, path)
@@ -145,7 +204,7 @@ func TestPersistence(t *testing.T) {
 	if len(tasks) != 1 || tasks[0].ID != 2 || tasks[0].Description != "desc" {
 		t.Fatalf("unexpected reloaded tasks: %+v", tasks)
 	}
-	c, _ := r.Create("three", "")
+	c, _ := r.Create("three", "", "")
 	if c.ID != 3 {
 		t.Fatalf("want ID 3 after reload, got %d", c.ID)
 	}
@@ -191,7 +250,7 @@ func TestOpenStore(t *testing.T) {
 			if !slices.Equal(ids, c.wantIDs) {
 				t.Fatalf("want IDs %v, got %v", c.wantIDs, ids)
 			}
-			n, err := s.Create("next", "")
+			n, err := s.Create("next", "", "")
 			if err != nil || n.ID != c.wantNext {
 				t.Fatalf("want next ID %d, got %d (%v)", c.wantNext, n.ID, err)
 			}
@@ -201,12 +260,12 @@ func TestOpenStore(t *testing.T) {
 
 func TestSaveFailureLeavesFile(t *testing.T) {
 	s, path := newTestStore(t)
-	s.Create("keep", "")
+	s.Create("keep", "", "")
 	before, _ := os.ReadFile(path)
 
 	forceSaveFailure(t, path) // platform-specific, see store_*_test.go
 
-	if _, err := s.Create("lost", ""); err == nil {
+	if _, err := s.Create("lost", "", ""); err == nil {
 		t.Fatal("want error from forced save failure")
 	}
 	if after, _ := os.ReadFile(path); !bytes.Equal(before, after) {
@@ -224,10 +283,10 @@ func TestSharedFile(t *testing.T) {
 	a, path := newTestStore(t)
 	b := openStore(t, path)
 
-	if _, err := a.Create("from a", ""); err != nil {
+	if _, err := a.Create("from a", "", ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := b.Create("from b", ""); err != nil {
+	if _, err := b.Create("from b", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	for _, s := range []*Store{a, b} {
@@ -246,7 +305,7 @@ func TestSharedFile(t *testing.T) {
 			if i%2 == 1 {
 				s = b
 			}
-			if _, err := s.Create("concurrent", ""); err != nil {
+			if _, err := s.Create("concurrent", "", ""); err != nil {
 				t.Error(err)
 			}
 		})

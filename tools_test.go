@@ -11,11 +11,12 @@ import (
 )
 
 // connect starts an in-memory server on a fresh store and returns a client
-// session connected to it.
-func connect(t *testing.T) *mcp.ClientSession {
+// session connected to it, plus the store's directory (its default scope).
+func connect(t *testing.T) (*mcp.ClientSession, string) {
 	t.Helper()
 	ctx := context.Background()
-	store, err := OpenStore(filepath.Join(t.TempDir(), "tasks.json"))
+	dir := t.TempDir()
+	store, err := OpenStore(filepath.Join(dir, "tasks.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -29,7 +30,7 @@ func connect(t *testing.T) *mcp.ClientSession {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { cs.Close() })
-	return cs
+	return cs, dir
 }
 
 // call invokes a tool and decodes its structured output into out.
@@ -63,7 +64,7 @@ func errorText(res *mcp.CallToolResult) string {
 }
 
 func TestTools(t *testing.T) {
-	cs := connect(t)
+	cs, dir := connect(t)
 
 	tools, err := cs.ListTools(context.Background(), nil)
 	if err != nil {
@@ -89,26 +90,41 @@ func TestTools(t *testing.T) {
 	}
 
 	var task Task
-	call(t, cs, "create_task", map[string]any{"title": "Write docs", "description": "README"}, &task)
-	if task.ID != 1 || task.Title != "Write docs" {
+	call(t, cs, "create_task", map[string]any{"title": "Write docs", "description": "README", "scope": "work"}, &task)
+	if task.ID != 1 || task.Title != "Write docs" || task.Scope != "work" {
 		t.Fatalf("create: %+v", task)
 	}
-	call(t, cs, "create_task", map[string]any{"title": "Ship it"}, nil)
+	call(t, cs, "create_task", map[string]any{"title": "Ship it"}, &task)
+	if task.ID != 2 || task.Scope != dir {
+		t.Fatalf("create without scope: want default scope %q, got %+v", dir, task)
+	}
 
 	var list taskList
 	call(t, cs, "list_tasks", map[string]any{}, &list)
 	if len(list.Tasks) != 2 {
 		t.Fatalf("list: %+v", list)
 	}
+	call(t, cs, "list_tasks", map[string]any{"scope": "WORK"}, &list)
+	if len(list.Tasks) != 1 || list.Tasks[0].ID != 1 {
+		t.Fatalf("list filtered by scope: %+v", list)
+	}
 
 	call(t, cs, "update_task", map[string]any{"id": 1, "title": "Write README"}, &task)
-	if task.Title != "Write README" || task.Description != "README" {
+	if task.Title != "Write README" || task.Description != "README" || task.Scope != "work" {
 		t.Fatalf("update: %+v", task)
 	}
 	modified := task.ModifiedAt
 	call(t, cs, "update_task", map[string]any{"id": 1}, &task)
 	if task.Title != "Write README" || !task.ModifiedAt.Equal(modified) {
 		t.Fatalf("update with no fields changed the task: %+v", task)
+	}
+	call(t, cs, "update_task", map[string]any{"id": 2, "scope": "home"}, &task)
+	if task.Scope != "home" {
+		t.Fatalf("update scope: %+v", task)
+	}
+	call(t, cs, "update_task", map[string]any{"id": 2, "scope": ""}, &task)
+	if task.Scope != dir {
+		t.Fatalf("update with empty scope: want reset to %q, got %+v", dir, task)
 	}
 
 	call(t, cs, "get_task", map[string]any{"id": 1}, &task)
@@ -123,6 +139,14 @@ func TestTools(t *testing.T) {
 	call(t, cs, "search_tasks", map[string]any{"query": ""}, &list)
 	if len(list.Tasks) != 2 {
 		t.Fatalf("search with empty query: %+v", list)
+	}
+	call(t, cs, "search_tasks", map[string]any{"query": "work"}, &list)
+	if len(list.Tasks) != 1 || list.Tasks[0].ID != 1 {
+		t.Fatalf("search matching scope text: %+v", list)
+	}
+	call(t, cs, "search_tasks", map[string]any{"query": "", "scope": dir}, &list)
+	if len(list.Tasks) != 1 || list.Tasks[0].ID != 2 {
+		t.Fatalf("search filtered by scope: %+v", list)
 	}
 
 	var del deleteResult

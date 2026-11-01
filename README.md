@@ -1,21 +1,25 @@
 # tasks-mcp
 
 A small MCP server that manages tasks stored in a JSON file. Each task has an
-`id`, `title`, `description`, `created_at` and `modified_at` (RFC 3339, UTC).
+`id`, `title`, `description`, `scope`, `created_at` and `modified_at`
+(RFC 3339, UTC). `scope` is a free-form grouping label; when a task is created
+without one it defaults to the directory containing the tasks file, so a task
+records which project it came from.
 
 ## Tools
 
 | Tool | Arguments |
 |---|---|
-| `create_task` | `title`, `description?` |
-| `list_tasks` | — (ordered by ID) |
+| `create_task` | `title`, `description?`, `scope?` |
+| `list_tasks` | `scope?` (ordered by ID) |
 | `get_task` | `id` |
-| `update_task` | `id`, `title?`, `description?` (only given fields change) |
+| `update_task` | `id`, `title?`, `description?`, `scope?` (only given fields change; an empty `scope` resets it to the default) |
 | `delete_task` | `id` |
-| `search_tasks` | `query` (case-insensitive match on title/description; empty matches all) |
+| `search_tasks` | `query`, `scope?` (case-insensitive match on title/description/scope; empty query matches all) |
 
+A `scope` filter is a case-insensitive exact match; omit it to get every task.
 An unknown `id` or a blank `title` is reported as a tool error, not a protocol
-error. Titles are trimmed of surrounding whitespace.
+error. Titles and scopes are trimmed of surrounding whitespace.
 
 ## Build & run
 
@@ -38,13 +42,15 @@ something in front of it provides those.
 {
   "next_id": 3,
   "tasks": [
-    {"id": 2, "title": "…", "description": "…", "created_at": "…", "modified_at": "…"}
+    {"id": 2, "title": "…", "description": "…", "scope": "/path/to/project", "created_at": "…", "modified_at": "…"}
   ]
 }
 ```
 
 The file is created on first write and rewritten atomically (temp file +
-rename) on every change. IDs are never reused.
+rename) on every change. IDs are never reused. Tasks from files written before
+`scope` existed are given the default scope when read, and it is persisted on
+the next write.
 
 Several processes may share one file: each operation takes an advisory lock
 on `<file>.lock` (`flock` on Unix, `LockFileEx` on Windows) and re-reads the

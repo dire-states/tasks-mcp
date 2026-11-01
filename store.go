@@ -19,6 +19,7 @@ type Task struct {
 	ID          int       `json:"id" jsonschema:"unique task ID"`
 	Title       string    `json:"title" jsonschema:"short task title"`
 	Description string    `json:"description" jsonschema:"longer task description"`
+	Scope       string    `json:"scope" jsonschema:"grouping label; defaults to the directory of the tasks file"`
 	CreatedAt   time.Time `json:"created_at" jsonschema:"creation time (RFC 3339, UTC)"`
 	ModifiedAt  time.Time `json:"modified_at" jsonschema:"last modification time (RFC 3339, UTC)"`
 }
@@ -43,9 +44,10 @@ type fileData struct {
 // LockFileEx on Windows (lock_unix.go, lock_windows.go); OpenStore fails on
 // platforms with neither.
 type Store struct {
-	path string
-	lock *os.File         // <path>.lock; only ever used as the flock target
-	now  func() time.Time // clock; overridden in tests
+	path         string
+	defaultScope string           // scope for tasks that have none: the tasks file's directory
+	lock         *os.File         // <path>.lock; only ever used as the flock target
+	now          func() time.Time // clock; overridden in tests
 
 	mu sync.Mutex // serialises goroutines in this process (flock is per file description)
 }
@@ -54,6 +56,10 @@ type Store struct {
 // file if it already exists. A missing or empty file yields an empty store;
 // the file is created on the first write.
 func OpenStore(path string) (*Store, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
 	lock, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, err
@@ -70,9 +76,10 @@ func OpenStore(path string) (*Store, error) {
 		return nil, err
 	}
 	return &Store{
-		path: path,
-		lock: lock,
-		now:  func() time.Time { return time.Now().UTC() },
+		path:         path,
+		defaultScope: filepath.Dir(abs),
+		lock:         lock,
+		now:          func() time.Time { return time.Now().UTC() },
 	}, nil
 }
 
@@ -176,6 +183,12 @@ func (s *Store) load(how int) (fileData, func(), error) {
 		unlock()
 		return fileData{}, nil, err
 	}
+	// Backfill tasks written before scope existed.
+	for i := range data.Tasks {
+		if data.Tasks[i].Scope == "" {
+			data.Tasks[i].Scope = s.defaultScope
+		}
+	}
 	return data, unlock, nil
 }
 
@@ -184,9 +197,24 @@ func indexOf(tasks []Task, id int) int {
 	return slices.IndexFunc(tasks, func(t Task) bool { return t.ID == id })
 }
 
+// scopeOrDefault trims scope and substitutes the default when it is blank.
+func (s *Store) scopeOrDefault(scope string) string {
+	if scope = strings.TrimSpace(scope); scope == "" {
+		return s.defaultScope
+	}
+	return scope
+}
+
+// matchesScope reports whether t is selected by the scope filter: an empty
+// filter selects everything, otherwise the scope must match
+// case-insensitively.
+func matchesScope(t Task, scope string) bool {
+	return scope == "" || strings.EqualFold(t.Scope, scope)
+}
+
 // Create adds a task with a fresh ID. The title is trimmed and must not be
-// blank.
-func (s *Store) Create(title, description string) (Task, error) {
+// blank; a blank scope becomes the default.
+func (s *Store) Create(title, description, scope string) (Task, error) {
 	title = strings.TrimSpace(title)
 	if title == "" {
 		return Task{}, ErrEmptyTitle
@@ -202,6 +230,7 @@ func (s *Store) Create(title, description string) (Task, error) {
 		ID:          data.NextID,
 		Title:       title,
 		Description: description,
+		Scope:       s.scopeOrDefault(scope),
 		CreatedAt:   now,
 		ModifiedAt:  now,
 	}
@@ -213,14 +242,21 @@ func (s *Store) Create(title, description string) (Task, error) {
 	return t, nil
 }
 
-// List returns all tasks ordered by ID.
-func (s *Store) List() ([]Task, error) {
+// List returns all tasks ordered by ID, restricted to one scope if scope is
+// non-empty.
+func (s *Store) List(scope string) ([]Task, error) {
 	data, unlock, err := s.load(lockShared)
 	if err != nil {
 		return nil, err
 	}
 	unlock()
-	return data.Tasks, nil
+	out := []Task{}
+	for _, t := range data.Tasks {
+		if matchesScope(t, scope) {
+			out = append(out, t)
+		}
+	}
+	return out, nil
 }
 
 // Get returns the task with the given ID.
@@ -238,9 +274,10 @@ func (s *Store) Get(id int) (Task, error) {
 }
 
 // Update changes the fields that are non-nil and bumps ModifiedAt. A new
-// title is trimmed and must not be blank. With neither field given the task
-// is returned unchanged and nothing is written.
-func (s *Store) Update(id int, title, description *string) (Task, error) {
+// title is trimmed and must not be blank; a blank scope resets to the
+// default. With no field given the task is returned unchanged and nothing
+// is written.
+func (s *Store) Update(id int, title, description, scope *string) (Task, error) {
 	if title != nil {
 		trimmed := strings.TrimSpace(*title)
 		if trimmed == "" {
@@ -258,7 +295,7 @@ func (s *Store) Update(id int, title, description *string) (Task, error) {
 	if i < 0 {
 		return Task{}, fmt.Errorf("%w: %d", ErrNotFound, id)
 	}
-	if title == nil && description == nil {
+	if title == nil && description == nil && scope == nil {
 		return data.Tasks[i], nil
 	}
 	t := data.Tasks[i]
@@ -267,6 +304,9 @@ func (s *Store) Update(id int, title, description *string) (Task, error) {
 	}
 	if description != nil {
 		t.Description = *description
+	}
+	if scope != nil {
+		t.Scope = s.scopeOrDefault(*scope)
 	}
 	t.ModifiedAt = s.now()
 	data.Tasks[i] = t
@@ -295,9 +335,10 @@ func (s *Store) Delete(id int) error {
 	return nil
 }
 
-// Search returns tasks whose title or description contains query,
-// case-insensitively. An empty query matches every task.
-func (s *Store) Search(query string) ([]Task, error) {
+// Search returns tasks whose title, description or scope contains query,
+// case-insensitively, restricted to one scope if scope is non-empty. An
+// empty query matches every task.
+func (s *Store) Search(query, scope string) ([]Task, error) {
 	q := strings.ToLower(query)
 	data, unlock, err := s.load(lockShared)
 	if err != nil {
@@ -307,8 +348,12 @@ func (s *Store) Search(query string) ([]Task, error) {
 
 	out := []Task{}
 	for _, t := range data.Tasks {
+		if !matchesScope(t, scope) {
+			continue
+		}
 		if strings.Contains(strings.ToLower(t.Title), q) ||
-			strings.Contains(strings.ToLower(t.Description), q) {
+			strings.Contains(strings.ToLower(t.Description), q) ||
+			strings.Contains(strings.ToLower(t.Scope), q) {
 			out = append(out, t)
 		}
 	}
